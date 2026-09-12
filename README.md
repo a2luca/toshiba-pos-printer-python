@@ -351,30 +351,146 @@ with ToshibaUsbCashDrawer() as cd:
 
 ---
 
-## How the VSP Driver Was Used (Reference)
+## Running and Spying on the Official Toshiba VSP Driver
 
-If you need to use the official Toshiba binary instead:
+This section documents how to run the official `vsd` binary and intercept its
+USB traffic with `usbmon`. This is how the IBM SureMark framing protocol was
+reverse-engineered.
 
-1. Extract VSP package to `/opt/tgcs/vsp/`
-2. Patch the binary for NixOS:
-   ```bash
-   GLIBC=$(ls /nix/store | grep glibc-multi | head -1)
-   patchelf --set-interpreter "/nix/store/${GLIBC}/lib/ld-linux-x86-64.so.2" \
-            --set-rpath "/nix/store/${GLIBC}/lib" \
-            /opt/tgcs/vsp/bin/vsd
-   ```
-3. Configure `/opt/tgcs/vsp/VSDConfig.xml`:
-   ```xml
-   <PRINTER_USB PID="4535" Serial_Number="41-DB202" VID="0f66">/dev/ttyS10</PRINTER_USB>
-   <Printer_Configuration>
-       <Emulation_Mode>2</Emulation_Mode>
-   </Printer_Configuration>
-   ```
-4. Blacklist `usblp`: create `/etc/modprobe.d/no-usblp.conf` containing `blacklist usblp`
-5. Run as root: `/opt/tgcs/vsp/bin/vsd -c /opt/tgcs/vsp/VSDConfig.xml`
-6. Write to `/dev/ttyS10` as any serial device (115200 8N1, though baud rate is irrelevant over USB)
+### Getting the VSP package
 
-The Python driver replaces steps 5-6 entirely — no daemon needed.
+Download from Toshiba Commerce (login may be required):
+```
+https://tgcs04.toshibacommerce.com/cs/groups/internet/documents/document/dnnw/x2xp/~edisp/vsp_linux.zip
+```
+
+Extract the `.deb` inside:
+```bash
+unzip vsp_linux.zip -d vsp_linux
+cd vsp_linux
+ar x toshiba-vsp-linux_*.deb
+tar xf data.tar.xz -C /tmp/vsp_data
+```
+
+### Patching the binary for NixOS
+
+`vsd` is a pre-built glibc binary. On NixOS the dynamic linker lives in the
+Nix store, so patchelf is required:
+
+```bash
+nix-shell -p patchelf
+GLIBC=$(ls /nix/store | grep "glibc-[0-9]" | grep -v "dev\|doc\|man\|bin\|static\|debug" | head -1)
+patchelf --set-interpreter "/nix/store/${GLIBC}/lib/ld-linux-x86-64.so.2" \
+         --set-rpath       "/nix/store/${GLIBC}/lib" \
+         /opt/tgcs/vsp/bin/vsd
+```
+
+### Configuring VSDConfig.xml
+
+Set the printer's VID, PID and serial number, and choose Epson emulation
+(mode 2) so `vsd` passes ESC/POS through unchanged:
+
+```xml
+<PRINTER_USB PID="4535" Serial_Number="41-DB202" VID="0f66">/dev/ttyS10</PRINTER_USB>
+<Printer_Configuration>
+    <Emulation_Mode>2</Emulation_Mode>
+    <Unsolicited_Status>0</Unsolicited_Status>
+</Printer_Configuration>
+```
+
+Enable verbose logging in `VSDLogging.xml`:
+```xml
+<Log_Level>5</Log_Level>
+```
+
+### Blacklisting usblp
+
+The kernel `usblp` module claims the printer before libusb can. Blacklist it:
+
+```bash
+echo "blacklist usblp" > /etc/modprobe.d/no-usblp.conf
+rmmod usblp   # unload immediately without rebooting
+```
+
+On NixOS, add to `configuration.nix` instead:
+```nix
+boot.blacklistedKernelModules = [ "usblp" ];
+```
+
+### Running vsd
+
+```bash
+# Run as root; vsd daemonises itself (output goes to /dev/null by default)
+/opt/tgcs/vsp/bin/vsd -c /opt/tgcs/vsp/VSDConfig.xml
+
+# After ~1 second /dev/ttyS10 (a PTY symlink) appears
+ls -la /dev/ttyS10
+
+# Send a test print
+printf '\x1b\x40Hello from serial\n\x1d\x56\x00' > /dev/ttyS10
+```
+
+### Spying on USB traffic with usbmon
+
+`usbmon` is a kernel subsystem that exposes raw USB packets as a text stream.
+Run it while `vsd` is bridging data and you can read every byte sent to the
+printer.
+
+```bash
+# Load the module
+modprobe usbmon
+
+# Find which bus the printer is on
+nix-shell -p usbutils --run "lsusb"
+# e.g. "Bus 001 Device 007: ID 0f66:4535" → bus 1
+
+# Start capturing in the background
+cat /sys/kernel/debug/usb/usbmon/1t > /tmp/usbmon.txt &
+
+# Trigger a print via vsd
+printf '\x1b\x40Test\n\x1d\x56\x00' > /dev/ttyS10
+sleep 1
+
+# Stop capture
+kill %1
+
+# Show only Bulk OUT packets to the printer (device 7 on bus 1)
+grep "Bo:1:007" /tmp/usbmon.txt
+```
+
+### Reading the usbmon output
+
+Each line looks like:
+```
+ffff... 123456 S Bo:1:007:2 -115 10 = 01070001 00000010 056043...
+                              ↑    ↑    ↑
+                              |    |    first bytes of the packet
+                              |    length
+                              S=submit C=complete
+```
+
+The first 7 bytes of every Bulk OUT payload are the IBM SureMark header:
+```
+01 [len+4] 00 01 00 00 00  [ESC/POS payload follows]
+```
+
+Filter only the submit lines and strip the header to see the raw ESC/POS:
+```bash
+grep " S Bo:1:007" /tmp/usbmon.txt | awk '{print $NF}' | \
+  sed 's/.\{14\}//'   # remove the 7-byte header (14 hex chars)
+```
+
+### The Python driver replaces all of this
+
+The Python driver talks directly to USB Interface 2 via libusb. No `vsd`,
+no PTY, no serial port emulation needed — just:
+
+```python
+from toshiba_6145_driver import Toshiba6145
+with Toshiba6145() as p:
+    p.print_line("Hello")
+    p.cut()
+```
 
 ---
 
