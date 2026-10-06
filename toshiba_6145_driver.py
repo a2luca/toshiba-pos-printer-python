@@ -615,10 +615,6 @@ class Toshiba6145:
 
             # reset attributes
             self._write(CMD_BOLD_OFF)
-            self._write(CMD_UNDERLINE_OFF)
-            self._write(CMD_DOUBLE_WIDE_OFF)
-            self._write(CMD_DOUBLE_HIGH_OFF)
-            self._write(CMD_INVERT_OFF)
             self._write(CMD_ALIGN_LEFT)
 
         self.feed(3)
@@ -764,7 +760,7 @@ if __name__ == "__main__":
             {"text": "Driver:   Pure Python + libusb", "align": "center"},
             {"text": "Firmware: 08.01", "align": "center"},
             "",
-            "=" * 32,
+            {"text": "=" * 32, "align": "center"},
             "",
             {"text": "QR Code Demo", "align": "center"},
         ])
